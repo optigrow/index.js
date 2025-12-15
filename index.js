@@ -5,67 +5,64 @@ const {
   Client,
   GatewayIntentBits,
   ChannelType,
-  PermissionFlagsBits
+  PermissionFlagsBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  SlashCommandBuilder,
+  Routes
 } = require("discord.js");
-
+const { REST } = require("@discordjs/rest");
 const express = require("express");
 
 // ========================
-// CORE CONFIG
+// ENV (matches your Render keys)
 // ========================
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN; // keep token in env for security
-const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL || null; // optional email via Zapier
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const BUSINESS_NAME = process.env.BUSINESS_NAME || "Your Business";
+const GUILD_ID = process.env.GUILD_ID;
 
-// Hard-wired for OptiGrow Discord
-const BUSINESS_NAME = "OptiGrow";
-const GUILD_ID = "1308790381130944552";
-const STAFF_ROLE_ID = "1448791779305590987";
-const START_HERE_CHANNEL_ID = "1308792753890525255";
+const INVITE_TARGET_CHANNEL_ID = process.env.INVITE_TARGET_CHANNEL_ID; // where client lands when joining
+const INVITE_REQUEST_CHANNEL_ID = process.env.INVITE_REQUEST_CHANNEL_ID; // where staff clicks button / uses /newclient
 
-// Team Members (OptiGrow)
-const FOUNDER1_USER_ID = "1267524002415513745"; // Founder 1
-const FOUNDER2_USER_ID = "1296561406518231134"; // Founder 2
+// ✅ replaced START_HERE_CHANNEL_ID with CURRICULUM_CHANNEL_ID
+const CURRICULUM_CHANNEL_ID = process.env.CURRICULUM_CHANNEL_ID || null;
 
-const CSM1_USER_ID = "1018939468763373589";
-const CSM2_USER_ID = "1322178805359706213";
-const CSM3_USER_ID = "775132202022600724";
+const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL || null;
 
-const FULFILMENT_USER_ID = "298481566932402178";
-const OPERATIONS_USER_ID = "754074867426525354";
+// Optional: secure endpoint for Zapier to post the button message daily
+const ZAPIER_POST_SECRET = process.env.ZAPIER_POST_SECRET || null;
+
+// Staff roles: supports ONE or MANY (comma-separated)
+const STAFF_ROLE_IDS = (process.env.STAFF_ROLE_IDS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Team mentions
+const FOUNDER_USER_ID = process.env.FOUNDER_USER_ID || null; // single user id
+const CSM_USER_IDS = (process.env.CSM_USER_IDS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const OPERATIONS_USER_ID = process.env.OPERATIONS_USER_ID || null; // single user id
+
+// Basic checks
+if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN");
+if (!GUILD_ID) throw new Error("Missing GUILD_ID");
+if (!INVITE_TARGET_CHANNEL_ID) throw new Error("Missing INVITE_TARGET_CHANNEL_ID");
+if (!INVITE_REQUEST_CHANNEL_ID) throw new Error("Missing INVITE_REQUEST_CHANNEL_ID");
 
 // ========================
-// EXPRESS SERVER FOR ZAPIER (INVITE MAP)
+// EXPRESS SERVER (health + optional zapier endpoints)
 // ========================
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-
-// inviteCode → firstname
-const inviteMap = new Map();
-
-// simple check
-app.get("/", (req, res) => {
-  res.send(`${BUSINESS_NAME} Discord Bot is running.`);
-});
-
-// Zapier posts inviteCode + firstname here
-app.post("/invite-map", (req, res) => {
-  const { inviteCode, firstname } = req.body;
-
-  if (!inviteCode || !firstname) {
-    return res.status(400).send("inviteCode and firstname required");
-  }
-
-  inviteMap.set(inviteCode, firstname);
-  console.log(`Mapped ${inviteCode} → ${firstname}`);
-
-  return res.send("ok");
-});
-
-app.listen(PORT, () => {
-  console.log("HTTP server listening on port " + PORT);
-});
+app.get("/", (req, res) => res.send(`${BUSINESS_NAME} bot running`));
 
 // ========================
 // DISCORD BOT SETUP
@@ -73,71 +70,348 @@ app.listen(PORT, () => {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMembers, // privileged (must be enabled in Dev Portal)
     GatewayIntentBits.GuildInvites
   ]
 });
 
-// Track invite usage
+// inviteCode -> firstname (in-memory)
+const inviteMap = new Map();
+// invite usage cache
 const inviteUses = new Map();
 
 // ========================
-// READY EVENT
+// HELPERS
+// ========================
+function mentionUser(userId, fallbackText) {
+  if (!userId) return fallbackText;
+  return `<@${userId}>`;
+}
+function mentionUsers(userIds, fallbackText) {
+  if (!userIds || userIds.length === 0) return fallbackText;
+  return userIds.map((id) => `<@${id}>`).join(" & ");
+}
+function mentionChannel(channelId, fallbackText) {
+  if (!channelId) return fallbackText;
+  return `<#${channelId}>`;
+}
+function slugify(input) {
+  return (input || "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9\-]/g, "")
+    .slice(0, 40);
+}
+function businessSlug() {
+  return slugify(BUSINESS_NAME) || "business";
+}
+function isStaff(member) {
+  // If no staff roles set, allow anyone (not recommended)
+  if (!STAFF_ROLE_IDS.length) return true;
+  return STAFF_ROLE_IDS.some((rid) => member.roles.cache.has(rid));
+}
+
+// ✅ Permission-safe channel send check (prevents “Missing Access” crashes)
+async function canSendTo(channel) {
+  if (!channel || !channel.isTextBased()) return false;
+
+  // Prefer cached "me" member object
+  const me =
+    channel.guild.members.me || (await channel.guild.members.fetch(client.user.id));
+  const perms = channel.permissionsFor(me);
+
+  return (
+    perms?.has(PermissionFlagsBits.ViewChannel) &&
+    perms?.has(PermissionFlagsBits.SendMessages)
+  );
+}
+
+// Button message content + components
+function buildInviteButtonMessage() {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("gen_invite_btn")
+      .setLabel("Generate New Client Invite")
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  return {
+    content:
+      "Click to generate a 1-use invite for a new client (firstname mapping included).",
+    components: [row]
+  };
+}
+
+// ========================
+// OPTIONAL: ZAPIER → POST BUTTON MESSAGE (SECURED)
+// ========================
+app.post("/post-invite-button", async (req, res) => {
+  try {
+    const incoming = req.header("x-zapier-secret");
+    if (!ZAPIER_POST_SECRET || incoming !== ZAPIER_POST_SECRET) {
+      return res.status(401).send("Unauthorized");
+    }
+
+    if (!client.isReady()) {
+      return res.status(503).send("Discord client not ready yet");
+    }
+
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const requestChannel = await guild.channels.fetch(INVITE_REQUEST_CHANNEL_ID);
+
+    if (!(await canSendTo(requestChannel))) {
+      return res
+        .status(403)
+        .send("Bot missing ViewChannel/SendMessages in INVITE_REQUEST_CHANNEL_ID");
+    }
+
+    await requestChannel.send(buildInviteButtonMessage());
+    return res.send("ok");
+  } catch (err) {
+    console.error("post-invite-button error:", err);
+    return res.status(500).send("error");
+  }
+});
+
+app.listen(process.env.PORT || 3000, () => console.log("HTTP server listening"));
+
+// ========================
+// REGISTER SLASH COMMAND
+// ========================
+async function registerCommands() {
+  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+
+  const commands = [
+    new SlashCommandBuilder()
+      .setName("newclient")
+      .setDescription(
+        "Generate a 1-use invite for a new client and map it to their firstname."
+      )
+      .addStringOption((opt) =>
+        opt
+          .setName("firstname")
+          .setDescription("Client firstname (used for category/channel)")
+          .setRequired(true)
+      )
+      .toJSON()
+  ];
+
+  await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), {
+    body: commands
+  });
+  console.log("✅ Slash command registered: /newclient");
+}
+
+// ========================
+// CREATE INVITE + MAP firstname
+// ========================
+async function createMappedInvite(firstnameRaw) {
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const inviteChannel = await guild.channels.fetch(INVITE_TARGET_CHANNEL_ID);
+
+  if (!inviteChannel || !inviteChannel.isTextBased()) {
+    throw new Error("Invite target channel not found or not text-based.");
+  }
+
+  // Ensure bot can create invites there
+  const me = guild.members.me || (await guild.members.fetch(client.user.id));
+  const perms = inviteChannel.permissionsFor(me);
+  if (!perms?.has(PermissionFlagsBits.CreateInstantInvite)) {
+    throw new Error(
+      "Bot missing Create Invite permission in INVITE_TARGET_CHANNEL_ID"
+    );
+  }
+
+  const firstname = firstnameRaw.trim();
+
+  const invite = await inviteChannel.createInvite({
+    maxUses: 1,
+    maxAge: 0,
+    unique: true
+  });
+
+  inviteMap.set(invite.code, firstname);
+  console.log(`Mapped (internal) ${invite.code} → ${firstname}`);
+
+  return `https://discord.gg/${invite.code}`;
+}
+
+// ========================
+// READY
 // ========================
 client.on("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
+  // Cache invites (if perms missing, don’t break bot)
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
-
-    if (!guild) {
-      console.log("⚠ No guild found. Invite caching skipped.");
-      return;
-    }
-
     const invites = await guild.invites.fetch();
-    invites.forEach(inv => inviteUses.set(inv.code, inv.uses));
-
+    invites.forEach((inv) => inviteUses.set(inv.code, inv.uses));
     console.log("Cached existing invites.");
   } catch (err) {
     console.error("Error caching invites:", err);
   }
+
+  // Register slash command
+  try {
+    await registerCommands();
+  } catch (err) {
+    console.error("Error registering commands:", err);
+  }
+
+  // ✅ Post the button message in the request channel (on boot) — permission safe
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const requestChannel = await guild.channels.fetch(INVITE_REQUEST_CHANNEL_ID);
+
+    if (await canSendTo(requestChannel)) {
+      await requestChannel.send(buildInviteButtonMessage());
+      console.log("✅ Posted invite button message on boot.");
+    } else {
+      console.log(
+        "⚠ Cannot post invite button message: missing ViewChannel/SendMessages in INVITE_REQUEST_CHANNEL_ID."
+      );
+    }
+  } catch (err) {
+    console.error("Error posting invite button:", err);
+  }
 });
 
 // ========================
-// MEMBER JOIN EVENT
+// INTERACTIONS (slash + button + modal)
+// ========================
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (!interaction.inGuild()) {
+      return interaction.reply({
+        content: "Use this inside the server.",
+        ephemeral: true
+      });
+    }
+
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const member = await guild.members.fetch(interaction.user.id);
+
+    if (!isStaff(member)) {
+      return interaction.reply({
+        content: "You don’t have permission to do that.",
+        ephemeral: true
+      });
+    }
+
+    // Slash command
+    if (interaction.isChatInputCommand() && interaction.commandName === "newclient") {
+      try {
+        const firstname = interaction.options.getString("firstname", true).trim();
+        const inviteUrl = await createMappedInvite(firstname);
+        return interaction.reply({
+          content: `✅ Invite for **${firstname}**:\n${inviteUrl}`,
+          ephemeral: true
+        });
+      } catch (err) {
+        console.error("/newclient failed:", err);
+        return interaction.reply({
+          content:
+            "❌ Failed to create invite. Check bot permissions (Create Invite + channel access).",
+          ephemeral: true
+        });
+      }
+    }
+
+    // ✅ Button handler (safe + no “interaction failed”)
+    if (interaction.isButton() && interaction.customId === "gen_invite_btn") {
+      try {
+        const modal = new ModalBuilder()
+          .setCustomId("gen_invite_modal")
+          .setTitle("New Client Invite");
+
+        const input = new TextInputBuilder()
+          .setCustomId("firstname_input")
+          .setLabel("Client firstname")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true);
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+
+        return await interaction.showModal(modal);
+      } catch (err) {
+        console.error("Button click -> showModal failed:", err);
+        try {
+          return await interaction.reply({
+            content: "⚠️ Button had an issue. Use `/newclient firstname:John` instead.",
+            ephemeral: true
+          });
+        } catch {
+          try {
+            return await interaction.followUp({
+              content: "⚠️ Button had an issue. Use `/newclient firstname:John` instead.",
+              ephemeral: true
+            });
+          } catch {}
+        }
+      }
+    }
+
+    // Modal submit
+    if (interaction.isModalSubmit() && interaction.customId === "gen_invite_modal") {
+      try {
+        const firstname = interaction.fields.getTextInputValue("firstname_input").trim();
+        const inviteUrl = await createMappedInvite(firstname);
+
+        return await interaction.reply({
+          content: `✅ Invite for **${firstname}**:\n${inviteUrl}`,
+          ephemeral: true
+        });
+      } catch (err) {
+        console.error("Modal submit failed:", err);
+        return await interaction.reply({
+          content: "❌ Couldn’t create invite. Check permissions and try again.",
+          ephemeral: true
+        });
+      }
+    }
+  } catch (err) {
+    console.error("interactionCreate error:", err);
+    try {
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: "Something went wrong.", ephemeral: true });
+      }
+    } catch {}
+  }
+});
+
+// ========================
+// ON JOIN: create category/channels + onboarding message
 // ========================
 client.on("guildMemberAdd", async (member) => {
   try {
     const guild = member.guild;
-    const newInvites = await guild.invites.fetch();
 
-    // Detect which invite was used
+    // Fetch invites to detect which code was used
     let usedInvite = null;
+    try {
+      const newInvites = await guild.invites.fetch();
+      newInvites.forEach((inv) => {
+        const prev = inviteUses.get(inv.code) || 0;
+        if (inv.uses > prev) usedInvite = inv;
+        inviteUses.set(inv.code, inv.uses);
+      });
+    } catch (err) {
+      console.error("Invite fetch failed on join (permissions?):", err);
+    }
 
-    newInvites.forEach(inv => {
-      const prev = inviteUses.get(inv.code) || 0;
-      if (inv.uses > prev) {
-        usedInvite = inv;
-      }
-      inviteUses.set(inv.code, inv.uses);
-    });
-
-    let firstname;
-
+    let firstname = "Client";
     if (usedInvite) {
-      const inviteCode = usedInvite.code;
-      firstname = inviteMap.get(inviteCode);
-
-      if (!firstname) {
-        console.log(`⚠ No firstname mapped for invite ${inviteCode}, falling back to displayName.`);
-        firstname = member.displayName || member.user.username || "Client";
-      } else {
-        console.log(`Invite ${usedInvite.code} matched to firstname: ${firstname}`);
-      }
+      firstname =
+        inviteMap.get(usedInvite.code) ||
+        member.displayName ||
+        member.user.username ||
+        "Client";
+      console.log(`Join matched invite ${usedInvite.code} → firstname: ${firstname}`);
     } else {
-      console.log(`⚠ Could not find used invite for ${member.user.tag}, falling back to displayName.`);
       firstname = member.displayName || member.user.username || "Client";
+      console.log(`⚠ No invite match. Using fallback firstname: ${firstname}`);
     }
 
     firstname = firstname.trim();
@@ -152,26 +426,22 @@ client.on("guildMemberAdd", async (member) => {
       type: ChannelType.GuildCategory
     });
 
-    // Permission rules
+    // Permission overwrites
     const overwrites = [
-      {
-        id: guild.roles.everyone.id,
-        deny: [PermissionFlagsBits.ViewChannel]
-      },
+      { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
       {
         id: member.id,
         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]
       },
       {
-        // allow the bot itself
         id: client.user.id,
         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]
       }
     ];
 
-    if (STAFF_ROLE_ID) {
+    for (const rid of STAFF_ROLE_IDS) {
       overwrites.push({
-        id: STAFF_ROLE_ID,
+        id: rid,
         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]
       });
     }
@@ -179,106 +449,74 @@ client.on("guildMemberAdd", async (member) => {
     await category.permissionOverwrites.set(overwrites);
 
     // ========================
-    // CREATE CHANNELS
+    // CREATE CHANNELS (1 personalised channel)
     // ========================
-    const channelNames = [
-      "🤝│team-chat",
-      "🚀│launch-tracking",
-      "🎯│campaigns",
-      "📞│appointments",
-      "🛠│systems",
-      "📚│resources"
-    ];
-
-    let teamChatChannel = null;
-
-    for (const name of channelNames) {
-      const createdChannel = await guild.channels.create({
-        name,
-        type: ChannelType.GuildText,
-        parent: category.id
-      });
-
-      if (name.includes("team-chat")) {
-        teamChatChannel = createdChannel;
-      }
-    }
+    const teamChatChannelName = `🤝│${businessSlug()}-${slugify(firstname)}`;
+    const teamChatChannel = await guild.channels.create({
+      name: teamChatChannelName,
+      type: ChannelType.GuildText,
+      parent: category.id
+    });
 
     // ========================
-    // SEND ONBOARDING MESSAGE (ONE MESSAGE)
+    // SEND ONBOARDING MESSAGE (UPDATED + curriculum mention)
     // ========================
-    if (teamChatChannel) {
-      const newMemberMention = `<@${member.id}>`;
+    const newMemberMention = `<@${member.id}>`;
+    const founder = mentionUser(FOUNDER_USER_ID, "Founder");
+    const csms = mentionUsers(CSM_USER_IDS, "Client Success Managers");
+    const ops = mentionUser(OPERATIONS_USER_ID, "Operations Manager");
+    const curriculum = mentionChannel(CURRICULUM_CHANNEL_ID, "#curriculum");
 
-      const founder1 = `<@${FOUNDER1_USER_ID}>`;
-      const founder2 = `<@${FOUNDER2_USER_ID}>`;
-
-      const csm1 = `<@${CSM1_USER_ID}>`;
-      const csm2 = `<@${CSM2_USER_ID}>`;
-      const csm3 = `<@${CSM3_USER_ID}>`;
-
-      const fulfilment = `<@${FULFILMENT_USER_ID}>`;
-      const operations = `<@${OPERATIONS_USER_ID}>`;
-      const startHere = `<#${START_HERE_CHANNEL_ID}>`;
-
-      const message = `
+    const msg = `
 ✨ **Welcome to ${BUSINESS_NAME}!**
 
-Hey ${newMemberMention}, welcome aboard.  
-You’ve just plugged into a team that lives and breathes performance, systems, and predictable growth.
+Hey ${newMemberMention}, we’re excited to have you here and officially get started together.
 
-From here, we’ll work with you to optimise your offer, build and refine your funnel, launch winning campaigns, and put the right automation in place so growth becomes repeatable — not random. You’re not just “working with an agency” — you’ve got an optimisation partner.
+By joining ${BUSINESS_NAME}, you’re partnering with a hands-on growth team focused on helping you scale your agency, coaching, or consulting business in a clear and repeatable way. Our goal is to remove confusion, handle execution, and give you a simple path to growth.
 
-⸻
+From here on out, we’ll work with you to refine your offer, build and launch ads and funnels, set up the right automations, and optimize everything based on real data. You’re not just hiring a service — you’re gaining a long-term growth partner.
 
-👥 **Your OptiGrow Team**
+- - - -
 
-${founder1} & ${founder2} – **Co-Founders / Growth Strategy**  
-Set the strategic direction, positioning, and high-level growth plan for your account.
+**I’d Like to Introduce You to Your Team…**
 
-${csm1}, ${csm2} & ${csm3} – **Client Success Team**  
-Your day-to-day partners. If you need clarity, priorities, or help unblocking something fast, they’re your first ping.
+${founder} – **Founder & Strategy Lead**  
+Oversees your growth strategy, offer positioning, and overall direction to ensure everything is built to scale.
 
-${fulfilment} – **Fulfilment Lead**  
-Oversees creatives, funnels, tracking, and ad implementation to make sure what we launch is sharp and aligned with your goals.
+${csms} – **Client Success Managers**  
+Your main point of contact. They’re here to answer questions, provide clarity, guide next steps, and keep you moving forward smoothly. They'll handle ad creation, funnel builds, automations, tracking, and ongoing optimization for your project aswel.
 
-${operations} – **Operations & Systems**  
-Keeps your onboarding, assets, and workflows organised so everything feels clean and under control behind the scenes.
+${ops} – **Operations Manager**  
+Ensures onboarding, timelines, and internal coordination run seamlessly so nothing falls through the cracks.
+- - - - -
 
-**Creative & Tech Support**  
-Handles builds, edits, integrations, tracking, and ongoing optimisations.
+**How We’ll Work Together**
 
-⸻
+This Discord is your direct line to the team. Ask questions anytime, share updates, and reach out whenever you need clarity, we’re here to support you at every step.
 
-📌 **How to use this space**
+- - - - -
 
-- Use **🤝│team-chat** for updates, questions, and async check-ins  
-- Track launches in **🚀│launch-tracking**  
-- Review and discuss **🎯│campaigns** and performance  
-- Coordinate calls and bookings in **📞│appointments**  
-- Keep tech, automations, and integrations in **🛠│systems**  
-- Store important docs, links, and assets in **📚│resources**
+**Next Steps (Please Complete in Order)**
 
-⸻
+1.  Invite any team members you’d like included in this workspace.  
+2.  Join the Circle Group in ${curriculum} and watch all Pre-Onboarding videos.  
+3.  Read your On-Boarding Email carefully, it outlines key expectations and what happens next.
 
-**Next step:** Head over to ${startHere} and complete your intake form.  
-That gives us the data we need to prioritise your setup and start optimising quickly.
+Once these are complete, we’ll take it from there and guide you through the rest.
 
-We’re pumped to build something scalable with you. 🚀
-      `.trim();
+We’re excited to grow with you. Welcome aboard!
+    `.trim();
 
-      await teamChatChannel.send(message);
-    }
+    await teamChatChannel.send(msg);
 
-    // ========================
-    // NOTIFY ZAPIER FOR EMAIL
-    // ========================
+    // Optional: notify Zapier on join
     if (ZAPIER_WEBHOOK_URL) {
       try {
         const payload = {
           firstname,
-          discordTag: `${member.user.username}#${member.user.discriminator}`,
+          businessName: BUSINESS_NAME,
           discordId: member.id,
+          discordTag: `${member.user.username}#${member.user.discriminator}`,
           categoryName,
           joinedAt: new Date().toISOString()
         };
@@ -293,17 +531,15 @@ We’re pumped to build something scalable with you. 🚀
       } catch (err) {
         console.error("Error notifying Zapier:", err);
       }
-    } else {
-      console.log("ZAPIER_WEBHOOK_URL not set, skipping email webhook.");
     }
 
-    console.log(`Created category + channels for ${firstname}`);
+    console.log(`✅ Created category + channel for ${firstname}`);
   } catch (err) {
-    console.error("Error in guildMemberAdd:", err);
+    console.error("guildMemberAdd error:", err);
   }
 });
 
 // ========================
-// LOGIN BOT
+// LOGIN
 // ========================
 client.login(DISCORD_TOKEN);
